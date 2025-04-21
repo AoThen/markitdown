@@ -7,8 +7,9 @@ from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
 # Try loading optional (but in this case, required) dependencies
 # Save reporting of any exceptions for later
 _dependency_exc_info = None
+olefile = None
 try:
-    import olefile
+    import olefile  # type: ignore[no-redef]
 except ImportError:
     # Preserve the error and stack trace for later
     _dependency_exc_info = sys.exc_info()
@@ -48,19 +49,20 @@ class OutlookMsgConverter(DocumentConverter):
         # Brute force, check if we have an OLE file
         cur_pos = file_stream.tell()
         try:
-            if not olefile.isOleFile(file_stream):
+            if olefile and not olefile.isOleFile(file_stream):
                 return False
         finally:
             file_stream.seek(cur_pos)
 
         # Brue force, check if it's an Outlook file
         try:
-            msg = olefile.OleFileIO(file_stream)
-            toc = "\n".join([str(stream) for stream in msg.listdir()])
-            return (
-                "__properties_version1.0" in toc
-                and "__recip_version1.0_#00000000" in toc
-            )
+            if olefile is not None:
+                msg = olefile.OleFileIO(file_stream)
+                toc = "\n".join([str(stream) for stream in msg.listdir()])
+                return (
+                    "__properties_version1.0" in toc
+                    and "__recip_version1.0_#00000000" in toc
+                )
         except Exception as e:
             pass
         finally:
@@ -88,7 +90,11 @@ class OutlookMsgConverter(DocumentConverter):
                 _dependency_exc_info[2]
             )
 
+        assert (
+            olefile is not None
+        )  # If we made it this far, olefile should be available
         msg = olefile.OleFileIO(file_stream)
+
         # Extract email metadata
         md_content = "# Email Message\n\n"
 
@@ -120,6 +126,7 @@ class OutlookMsgConverter(DocumentConverter):
 
     def _get_stream_data(self, msg: Any, stream_path: str) -> Union[str, None]:
         """Helper to safely extract and decode stream data from the MSG file."""
+        assert olefile is not None
         assert isinstance(
             msg, olefile.OleFileIO
         )  # Ensure msg is of the correct type (type hinting is not possible with the optional olefile package)

@@ -7,8 +7,14 @@ from .._exceptions import MissingDependencyException
 # Save reporting of any exceptions for later
 _dependency_exc_info = None
 try:
-    import speech_recognition as sr
-    import pydub
+    # Suppress some warnings on library import
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        warnings.filterwarnings("ignore", category=SyntaxWarning)
+        import speech_recognition as sr
+        import pydub
 except ImportError:
     # Preserve the error and stack trace for later
     _dependency_exc_info = sys.exc_info()

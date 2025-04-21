@@ -3,22 +3,24 @@ import mimetypes
 import os
 import re
 import sys
+import shutil
 import tempfile
 import warnings
 import traceback
 import io
 from dataclasses import dataclass
 from importlib.metadata import entry_points
-from typing import Any, List, Optional, Union, BinaryIO
+from typing import Any, List, Dict, Optional, Union, BinaryIO
 from pathlib import Path
 from urllib.parse import urlparse
 from warnings import warn
-
-# File-format detection
-import puremagic
 import requests
+import magika
+import charset_normalizer
+import codecs
 
-from ._stream_info import StreamInfo, _guess_stream_info_from_stream
+from ._stream_info import StreamInfo
+from ._uri_utils import parse_data_uri, file_uri_to_path
 
 from .converters import (
     PlainTextConverter,
@@ -37,7 +39,9 @@ from .converters import (
     AudioConverter,
     OutlookMsgConverter,
     ZipConverter,
+    EpubConverter,
     DocumentIntelligenceConverter,
+    CsvConverter,
 )
 
 from ._base_converter import DocumentConverter, DocumentConverterResult
@@ -109,6 +113,8 @@ class MarkItDown:
         else:
             self._requests_session = requests_session
 
+        self._magika = magika.Magika()
+
         # TODO - remove these (see enable_builtins)
         self._llm_client: Any = None
         self._llm_model: Union[str | None] = None
@@ -138,8 +144,30 @@ class MarkItDown:
             self._llm_model = kwargs.get("llm_model")
             self._exiftool_path = kwargs.get("exiftool_path")
             self._style_map = kwargs.get("style_map")
+
             if self._exiftool_path is None:
                 self._exiftool_path = os.getenv("EXIFTOOL_PATH")
+
+            # Still none? Check well-known paths
+            if self._exiftool_path is None:
+                candidate = shutil.which("exiftool")
+                if candidate:
+                    candidate = os.path.abspath(candidate)
+                    if any(
+                        d == os.path.dirname(candidate)
+                        for d in [
+                            "/usr/bin",
+                            "/usr/local/bin",
+                            "/opt",
+                            "/opt/bin",
+                            "/opt/local/bin",
+                            "/opt/homebrew/bin",
+                            "C:\\Windows\\System32",
+                            "C:\\Program Files",
+                            "C:\\Program Files (x86)",
+                        ]
+                    ):
+                        self._exiftool_path = candidate
 
             # Register converters for successful browsing operations
             # Later registrations are tried first / take higher priority than earlier registrations
@@ -166,12 +194,25 @@ class MarkItDown:
             self.register_converter(IpynbConverter())
             self.register_converter(PdfConverter())
             self.register_converter(OutlookMsgConverter())
+            self.register_converter(EpubConverter())
+            self.register_converter(CsvConverter())
 
             # Register Document Intelligence converter at the top of the stack if endpoint is provided
             docintel_endpoint = kwargs.get("docintel_endpoint")
             if docintel_endpoint is not None:
+                docintel_args: Dict[str, Any] = {}
+                docintel_args["endpoint"] = docintel_endpoint
+
+                docintel_credential = kwargs.get("docintel_credential")
+                if docintel_credential is not None:
+                    docintel_args["credential"] = docintel_credential
+
+                docintel_types = kwargs.get("docintel_file_types")
+                if docintel_types is not None:
+                    docintel_args["file_types"] = docintel_types
+
                 self.register_converter(
-                    DocumentIntelligenceConverter(endpoint=docintel_endpoint)
+                    DocumentIntelligenceConverter(**docintel_args),
                 )
 
             self._builtins_enabled = True
@@ -215,11 +256,19 @@ class MarkItDown:
         # Local path or url
         if isinstance(source, str):
             if (
-                source.startswith("http://")
-                or source.startswith("https://")
-                or source.startswith("file://")
+                source.startswith("http:")
+                or source.startswith("https:")
+                or source.startswith("file:")
+                or source.startswith("data:")
             ):
-                return self.convert_url(source, **kwargs)
+                # Rename the url argument to mock_url
+                # (Deprecated -- use stream_info)
+                _kwargs = {k: v for k, v in kwargs.items()}
+                if "url" in _kwargs:
+                    _kwargs["mock_url"] = _kwargs["url"]
+                    del _kwargs["url"]
+
+                return self.convert_uri(source, stream_info=stream_info, **_kwargs)
             else:
                 return self.convert_local(source, stream_info=stream_info, **kwargs)
         # Path object
@@ -227,14 +276,14 @@ class MarkItDown:
             return self.convert_local(source, stream_info=stream_info, **kwargs)
         # Request response
         elif isinstance(source, requests.Response):
-            return self.convert_response(source, **kwargs)
+            return self.convert_response(source, stream_info=stream_info, **kwargs)
         # Binary stream
         elif (
             hasattr(source, "read")
             and callable(source.read)
             and not isinstance(source, io.TextIOBase)
         ):
-            return self.convert_stream(source, **kwargs)
+            return self.convert_stream(source, stream_info=stream_info, **kwargs)
         else:
             raise TypeError(
                 f"Invalid source type: {type(source)}. Expected str, requests.Response, BinaryIO."
@@ -253,33 +302,28 @@ class MarkItDown:
             path = str(path)
 
         # Build a base StreamInfo object from which to start guesses
-        base_stream_info = StreamInfo(
+        base_guess = StreamInfo(
             local_path=path,
             extension=os.path.splitext(path)[1],
             filename=os.path.basename(path),
         )
 
-        # Extend the base_stream_info with any additional info from the arguments
+        # Extend the base_guess with any additional info from the arguments
         if stream_info is not None:
-            base_stream_info = base_stream_info.copy_and_update(stream_info)
+            base_guess = base_guess.copy_and_update(stream_info)
 
         if file_extension is not None:
             # Deprecated -- use stream_info
-            base_stream_info = base_stream_info.copy_and_update(
-                extension=file_extension
-            )
+            base_guess = base_guess.copy_and_update(extension=file_extension)
 
         if url is not None:
             # Deprecated -- use stream_info
-            base_stream_info = base_stream_info.copy_and_update(url=url)
+            base_guess = base_guess.copy_and_update(url=url)
 
         with open(path, "rb") as fh:
-            # Prepare a list of configurations to try, starting with the base_stream_info
-            guesses: List[StreamInfo] = [base_stream_info]
-            for guess in _guess_stream_info_from_stream(
-                file_stream=fh, filename_hint=path
-            ):
-                guesses.append(base_stream_info.copy_and_update(guess))
+            guesses = self._get_stream_info_guesses(
+                file_stream=fh, base_guess=base_guess
+            )
             return self._convert(file_stream=fh, stream_info_guesses=guesses, **kwargs)
 
     def convert_stream(
@@ -312,37 +356,102 @@ class MarkItDown:
                 assert base_guess is not None  # for mypy
                 base_guess = base_guess.copy_and_update(url=url)
 
-        # Append the base guess, if it's non-trivial
-        if base_guess is not None:
-            if base_guess.mimetype is not None or base_guess.extension is not None:
-                guesses.append(base_guess)
-        else:
-            # Create a base guess with no information
-            base_guess = StreamInfo()
-
-        # Create a placeholder filename to help with guessing
-        placeholder_filename = None
-        if base_guess.filename is not None:
-            placeholder_filename = base_guess.filename
-        elif base_guess.extension is not None:
-            placeholder_filename = "placeholder" + base_guess.extension
+        # Check if we have a seekable stream. If not, load the entire stream into memory.
+        if not stream.seekable():
+            buffer = io.BytesIO()
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+            buffer.seek(0)
+            stream = buffer
 
         # Add guesses based on stream content
-        for guess in _guess_stream_info_from_stream(
-            file_stream=stream, filename_hint=placeholder_filename
-        ):
-            guesses.append(base_guess.copy_and_update(guess))
-
-        # Perform the conversion
+        guesses = self._get_stream_info_guesses(
+            file_stream=stream, base_guess=base_guess or StreamInfo()
+        )
         return self._convert(file_stream=stream, stream_info_guesses=guesses, **kwargs)
 
     def convert_url(
-        self, url: str, **kwargs: Any
-    ) -> DocumentConverterResult:  # TODO: fix kwargs type
-        # Send a HTTP request to the URL
-        response = self._requests_session.get(url, stream=True)
-        response.raise_for_status()
-        return self.convert_response(response, **kwargs)
+        self,
+        url: str,
+        *,
+        stream_info: Optional[StreamInfo] = None,
+        file_extension: Optional[str] = None,
+        mock_url: Optional[str] = None,
+        **kwargs: Any,
+    ) -> DocumentConverterResult:
+        """Alias for convert_uri()"""
+        # convert_url will likely be deprecated in the future in favor of convert_uri
+        return self.convert_uri(
+            url,
+            stream_info=stream_info,
+            file_extension=file_extension,
+            mock_url=mock_url,
+            **kwargs,
+        )
+
+    def convert_uri(
+        self,
+        uri: str,
+        *,
+        stream_info: Optional[StreamInfo] = None,
+        file_extension: Optional[str] = None,  # Deprecated -- use stream_info
+        mock_url: Optional[
+            str
+        ] = None,  # Mock the request as if it came from a different URL
+        **kwargs: Any,
+    ) -> DocumentConverterResult:
+        uri = uri.strip()
+
+        # File URIs
+        if uri.startswith("file:"):
+            netloc, path = file_uri_to_path(uri)
+            if netloc and netloc != "localhost":
+                raise ValueError(
+                    f"Unsupported file URI: {uri}. Netloc must be empty or localhost."
+                )
+            return self.convert_local(
+                path,
+                stream_info=stream_info,
+                file_extension=file_extension,
+                url=mock_url,
+                **kwargs,
+            )
+        # Data URIs
+        elif uri.startswith("data:"):
+            mimetype, attributes, data = parse_data_uri(uri)
+
+            base_guess = StreamInfo(
+                mimetype=mimetype,
+                charset=attributes.get("charset"),
+            )
+            if stream_info is not None:
+                base_guess = base_guess.copy_and_update(stream_info)
+
+            return self.convert_stream(
+                io.BytesIO(data),
+                stream_info=base_guess,
+                file_extension=file_extension,
+                url=mock_url,
+                **kwargs,
+            )
+        # HTTP/HTTPS URIs
+        elif uri.startswith("http:") or uri.startswith("https:"):
+            response = self._requests_session.get(uri, stream=True)
+            response.raise_for_status()
+            return self.convert_response(
+                response,
+                stream_info=stream_info,
+                file_extension=file_extension,
+                url=mock_url,
+                **kwargs,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported URI scheme: {uri.split(':')[0]}. Supported schemes are: file:, data:, http:, https:"
+            )
 
     def convert_response(
         self,
@@ -404,31 +513,16 @@ class MarkItDown:
             # Deprecated -- use stream_info
             base_guess = base_guess.copy_and_update(url=url)
 
-        # Add the guess if its non-trivial
-        guesses: List[StreamInfo] = []
-        if base_guess.mimetype is not None or base_guess.extension is not None:
-            guesses.append(base_guess)
-
         # Read into BytesIO
         buffer = io.BytesIO()
         for chunk in response.iter_content(chunk_size=512):
             buffer.write(chunk)
         buffer.seek(0)
 
-        # Create a placeholder filename to help with guessing
-        placeholder_filename = None
-        if base_guess.filename is not None:
-            placeholder_filename = base_guess.filename
-        elif base_guess.extension is not None:
-            placeholder_filename = "placeholder" + base_guess.extension
-
-        # Add guesses based on stream content
-        for guess in _guess_stream_info_from_stream(
-            file_stream=buffer, filename_hint=placeholder_filename
-        ):
-            guesses.append(base_guess.copy_and_update(guess))
-
         # Convert
+        guesses = self._get_stream_info_guesses(
+            file_stream=buffer, base_guess=base_guess
+        )
         return self._convert(file_stream=buffer, stream_info_guesses=guesses, **kwargs)
 
     def _convert(
@@ -562,3 +656,115 @@ class MarkItDown:
         self._converters.insert(
             0, ConverterRegistration(converter=converter, priority=priority)
         )
+
+    def _get_stream_info_guesses(
+        self, file_stream: BinaryIO, base_guess: StreamInfo
+    ) -> List[StreamInfo]:
+        """
+        Given a base guess, attempt to guess or expand on the stream info using the stream content (via magika).
+        """
+        guesses: List[StreamInfo] = []
+
+        # Enhance the base guess with information based on the extension or mimetype
+        enhanced_guess = base_guess.copy_and_update()
+
+        # If there's an extension and no mimetype, try to guess the mimetype
+        if base_guess.mimetype is None and base_guess.extension is not None:
+            _m, _ = mimetypes.guess_type(
+                "placeholder" + base_guess.extension, strict=False
+            )
+            if _m is not None:
+                enhanced_guess = enhanced_guess.copy_and_update(mimetype=_m)
+
+        # If there's a mimetype and no extension, try to guess the extension
+        if base_guess.mimetype is not None and base_guess.extension is None:
+            _e = mimetypes.guess_all_extensions(base_guess.mimetype, strict=False)
+            if len(_e) > 0:
+                enhanced_guess = enhanced_guess.copy_and_update(extension=_e[0])
+
+        # Call magika to guess from the stream
+        cur_pos = file_stream.tell()
+        try:
+            result = self._magika.identify_stream(file_stream)
+            if result.status == "ok" and result.prediction.output.label != "unknown":
+                # If it's text, also guess the charset
+                charset = None
+                if result.prediction.output.is_text:
+                    # Read the first 4k to guess the charset
+                    file_stream.seek(cur_pos)
+                    stream_page = file_stream.read(4096)
+                    charset_result = charset_normalizer.from_bytes(stream_page).best()
+
+                    if charset_result is not None:
+                        charset = self._normalize_charset(charset_result.encoding)
+
+                # Normalize the first extension listed
+                guessed_extension = None
+                if len(result.prediction.output.extensions) > 0:
+                    guessed_extension = "." + result.prediction.output.extensions[0]
+
+                # Determine if the guess is compatible with the base guess
+                compatible = True
+                if (
+                    base_guess.mimetype is not None
+                    and base_guess.mimetype != result.prediction.output.mime_type
+                ):
+                    compatible = False
+
+                if (
+                    base_guess.extension is not None
+                    and base_guess.extension.lstrip(".")
+                    not in result.prediction.output.extensions
+                ):
+                    compatible = False
+
+                if (
+                    base_guess.charset is not None
+                    and self._normalize_charset(base_guess.charset) != charset
+                ):
+                    compatible = False
+
+                if compatible:
+                    # Add the compatible base guess
+                    guesses.append(
+                        StreamInfo(
+                            mimetype=base_guess.mimetype
+                            or result.prediction.output.mime_type,
+                            extension=base_guess.extension or guessed_extension,
+                            charset=base_guess.charset or charset,
+                            filename=base_guess.filename,
+                            local_path=base_guess.local_path,
+                            url=base_guess.url,
+                        )
+                    )
+                else:
+                    # The magika guess was incompatible with the base guess, so add both guesses
+                    guesses.append(enhanced_guess)
+                    guesses.append(
+                        StreamInfo(
+                            mimetype=result.prediction.output.mime_type,
+                            extension=guessed_extension,
+                            charset=charset,
+                            filename=base_guess.filename,
+                            local_path=base_guess.local_path,
+                            url=base_guess.url,
+                        )
+                    )
+            else:
+                # There were no other guesses, so just add the base guess
+                guesses.append(enhanced_guess)
+        finally:
+            file_stream.seek(cur_pos)
+
+        return guesses
+
+    def _normalize_charset(self, charset: str | None) -> str | None:
+        """
+        Normalize a charset string to a canonical form.
+        """
+        if charset is None:
+            return None
+        try:
+            return codecs.lookup(charset).name
+        except LookupError:
+            return charset
